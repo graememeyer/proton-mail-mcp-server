@@ -1,0 +1,5 @@
+python-dotenv
+pydantic
+pydantic-settings
+fastmcp>=3.4,<4
+imap-tools>=1.15,<2

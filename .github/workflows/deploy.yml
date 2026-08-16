@@ -1,0 +1,84 @@
+name: Deploy to Proxmox LXC
+
+# Deploys the server to the proton-mcp LXC via the on-box self-hosted runner.
+# Contract (mirrors graememeyer/outlook-mcp-server):
+#   * rsync the repo into /opt/proton-mcp/app
+#   * build/refresh the venv at /opt/proton-mcp/venv from requirements.txt
+#   * restart the service (the ONLY privileged action the `gha` runner may take, pinned in
+#     /etc/sudoers.d/gha to exactly `systemctl restart proton-mcp.service`)
+#   * health-gate on the MCP `initialize` handshake
+# Any diagnostic MUST be read-only / non-sudo — `gha` may not sudo anything else.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-proton-mcp
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest pytest-asyncio
+
+      # The suite is entirely offline: no Bridge, no credentials, no network.
+      - name: Run tests
+        run: pytest -q
+
+  deploy:
+    needs: test
+    runs-on: self-hosted
+    env:
+      APP_DIR: /opt/proton-mcp/app
+      VENV_DIR: /opt/proton-mcp/venv
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sync code into the deploy tree
+        run: |
+          rsync -a --delete \
+            --exclude '.git' \
+            --exclude 'venv' \
+            --exclude '__pycache__' \
+            --exclude '.github' \
+            ./ "$APP_DIR/"
+
+      - name: Build/refresh venv
+        run: |
+          if [ ! -x "$VENV_DIR/bin/python" ]; then
+            python3 -m venv "$VENV_DIR"
+          fi
+          "$VENV_DIR/bin/python" -m pip install --upgrade pip
+          "$VENV_DIR/bin/python" -m pip install -r "$APP_DIR/requirements.txt"
+
+      - name: Restart service
+        run: sudo /usr/bin/systemctl restart proton-mcp.service
+
+      - name: Health check (MCP initialize -> 200)
+        run: |
+          for i in $(seq 1 15); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8000/mcp \
+              -H 'Content-Type: application/json' \
+              -H 'Accept: application/json, text/event-stream' \
+              -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"gha","version":"0"}}}' || true)
+            echo "attempt $i: HTTP $code"
+            if [ "$code" = "200" ]; then exit 0; fi
+            sleep 2
+          done
+          echo "Health check failed"; systemctl status proton-mcp.service --no-pager || true
+          exit 1
