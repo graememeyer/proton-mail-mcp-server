@@ -22,9 +22,9 @@ class Settings(BaseSettings):
     PROTON_BRIDGE_USER: str
     PROTON_BRIDGE_PASSWORD: str
 
-    # Address used in the From header when sending. Defaults to the Bridge user,
-    # which is what Bridge's SMTP submission expects; override only to send as a
-    # different address on the same account.
+    # Default address for the From header when sending; send_email's
+    # from_address parameter overrides it per message. Defaults to the Bridge
+    # user. Any value here must be an active address on the same account.
     PROTON_SEND_FROM: Optional[str] = None
 
     # Bridge listens with STARTTLS on both ports by default. "ssl" (implicit TLS)

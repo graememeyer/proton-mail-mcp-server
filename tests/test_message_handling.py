@@ -8,7 +8,13 @@ import pytest
 
 from mail.formatting import html_to_text
 from mail.search import build_search_criteria
-from mail.send import build_message, looks_like_html, split_addresses
+from mail.send import (
+    InvalidSender,
+    build_message,
+    looks_like_html,
+    normalise_sender,
+    split_addresses,
+)
 
 
 # ------------------------------------------------------------- html_to_text
@@ -127,6 +133,56 @@ def test_threading_without_prior_references():
 def test_no_thread_means_no_threading_headers():
     msg = build_message("me@proton.me", ["a@x.com"], [], [], "Hi", "Body")
     assert msg["In-Reply-To"] is None and msg["References"] is None
+
+
+# ------------------------------------------------------------ sender override
+
+def test_blank_from_address_falls_back_to_the_configured_sender():
+    # conftest sets the Bridge user, and PROTON_SEND_FROM is unset.
+    assert normalise_sender("") == ("test@proton.me", "test@proton.me")
+    assert normalise_sender("   ") == ("test@proton.me", "test@proton.me")
+
+
+def test_bare_address_is_used_for_both_header_and_envelope():
+    assert normalise_sender("other@protonmail.com") == (
+        "other@protonmail.com",
+        "other@protonmail.com",
+    )
+
+
+def test_display_name_is_kept_in_the_header_only():
+    # The envelope has to be the bare address: it is what Bridge matches
+    # against the addresses on the account.
+    header, envelope = normalise_sender("Graeme <other@protonmail.com>")
+    assert header == "Graeme <other@protonmail.com>"
+    assert envelope == "other@protonmail.com"
+
+
+def test_surrounding_whitespace_is_trimmed():
+    assert normalise_sender("  other@protonmail.com  ")[1] == "other@protonmail.com"
+
+
+@pytest.mark.parametrize(
+    "bad", ["not-an-address", "@protonmail.com", "other@", "Graeme <>"]
+)
+def test_malformed_addresses_are_rejected(bad):
+    with pytest.raises(InvalidSender):
+        normalise_sender(bad)
+
+
+def test_multiple_addresses_are_rejected():
+    # A single From is the only thing that makes sense on submission.
+    with pytest.raises(InvalidSender):
+        normalise_sender("a@proton.me, b@proton.me")
+
+
+def test_message_id_domain_follows_a_display_name_sender():
+    # The Message-ID domain is derived from the address, not the raw header.
+    msg = build_message(
+        "Graeme <me@protonmail.com>", ["a@x.com"], [], [], "Hi", "Body"
+    )
+    assert msg["From"] == "Graeme <me@protonmail.com>"
+    assert msg["Message-ID"].endswith("@protonmail.com>")
 
 
 # ------------------------------------------------------------ search criteria

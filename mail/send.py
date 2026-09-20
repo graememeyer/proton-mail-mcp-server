@@ -5,13 +5,27 @@ Submission goes through Bridge's local SMTP listener, which re-encrypts the
 message for the recipients (PGP for Proton-to-Proton, plain SMTP otherwise) and
 files a copy in Sent. There is nothing to do here beyond building a well-formed
 MIME message.
+
+The From address defaults to PROTON_SEND_FROM (or the Bridge user) but can be
+overridden per message. Bridge accepts any address that belongs to the account
+it is logged in as, so this is how a second address on the same account is used
+without restarting the server. Bridge itself is the authority on ownership --
+there is no way to enumerate the account's addresses over IMAP -- so an address
+that is not on the account is caught at submission and reported as such.
 """
 
-__all__ = ["handle_send_email", "split_addresses", "build_message"]
+__all__ = [
+    "handle_send_email",
+    "split_addresses",
+    "build_message",
+    "normalise_sender",
+    "InvalidSender",
+]
 
 import asyncio
+import smtplib
 from email.message import EmailMessage
-from email.utils import formatdate, make_msgid
+from email.utils import formatdate, getaddresses, make_msgid, parseaddr
 from typing import List, Optional, Tuple
 
 from config import settings
@@ -25,6 +39,39 @@ _IMPORTANCE = {
     "normal": ("3", "Normal"),
     "high": ("1", "High"),
 }
+
+
+class InvalidSender(ValueError):
+    """Raised when a caller-supplied From address is not a usable address."""
+
+
+def normalise_sender(from_address: str) -> Tuple[str, str]:
+    """Turn a caller-supplied From value into (header value, envelope address).
+
+    Accepts either a bare address ("me@proton.me") or a display-name form
+    ("Graeme <me@proton.me>"). The header keeps whatever was given; the envelope
+    gets the bare address, because that is what Bridge matches against the
+    addresses on the account. An empty value falls back to the configured
+    default, which is the pre-existing behaviour.
+    """
+    candidate = (from_address or "").strip()
+    if not candidate:
+        return settings.send_from, settings.send_from
+
+    if "," in candidate or len(getaddresses([candidate])) > 1:
+        raise InvalidSender(
+            f"from_address must be a single address, got {from_address!r}."
+        )
+
+    _, envelope = parseaddr(candidate)
+    local, _, domain = envelope.partition("@")
+    if not local or not domain:
+        raise InvalidSender(
+            f"{from_address!r} is not a valid email address. Pass a bare address "
+            f'("you@proton.me") or a display-name form ("You <you@proton.me>").'
+        )
+
+    return candidate, envelope
 
 
 def split_addresses(addresses: str) -> List[str]:
@@ -62,7 +109,9 @@ def build_message(
     message["Subject"] = subject
     message["Date"] = formatdate(localtime=True)
 
-    domain = sender.rpartition("@")[2] or None
+    # sender may be "Name <addr@domain>", so the domain comes from the parsed
+    # address rather than from the raw header value.
+    domain = parseaddr(sender)[1].rpartition("@")[2] or None
     message["Message-ID"] = make_msgid(domain=domain)
 
     if importance.lower() != "normal":
@@ -119,8 +168,10 @@ def _send_email(
     body: str,
     importance: str,
     reply_to_id: str,
+    from_address: str = "",
 ) -> str:
     """Blocking body of send_email; runs in a worker thread."""
+    sender, envelope_sender = normalise_sender(from_address)
     to_list = split_addresses(to)
     cc_list = split_addresses(cc)
     bcc_list = split_addresses(bcc)
@@ -135,7 +186,6 @@ def _send_email(
                 else f"Re: {original_subject}"
             )
 
-    sender = settings.send_from
     message = build_message(
         sender, to_list, cc_list, bcc_list, subject, body, importance, thread
     )
@@ -143,7 +193,22 @@ def _send_email(
     with smtp_connection() as server:
         # Bcc recipients are passed to the envelope but deliberately not written
         # into a header, which is what makes them blind.
-        server.send_message(message, from_addr=sender, to_addrs=to_list + cc_list + bcc_list)
+        try:
+            server.send_message(
+                message,
+                from_addr=envelope_sender,
+                to_addrs=to_list + cc_list + bcc_list,
+            )
+        except smtplib.SMTPSenderRefused as exc:
+            # Bridge refuses a From that is not an active address on the account
+            # it is logged in as. That is the common failure for this parameter,
+            # so name it rather than letting a raw SMTP code through.
+            raise BridgeError(
+                f"Proton Bridge refused {envelope_sender!r} as the sender. It must "
+                f"be an active address on the account Bridge is logged in as "
+                f"({settings.PROTON_BRIDGE_USER}). Bridge reported: "
+                f"{exc.smtp_error.decode(errors='replace') if isinstance(exc.smtp_error, bytes) else exc.smtp_error}"
+            ) from exc
 
     extra = (f" + {len(cc_list)} CC" if cc_list else "") + (
         f" + {len(bcc_list)} BCC" if bcc_list else ""
@@ -167,6 +232,7 @@ async def handle_send_email(
     body: str = "",
     importance: str = "normal",
     reply_to_id: str = "",
+    from_address: str = "",
 ) -> str:
     """
     Send an email from the Proton Mail account
@@ -187,6 +253,11 @@ async def handle_send_email(
             search_emails. Sets the threading headers so the reply appears in
             the original conversation. Recipients are NOT filled in
             automatically - pass them in `to` yourself.
+        from_address: Address to send as. Must be an active address on the same
+            Proton account Bridge is logged in as; any other address is refused
+            by Bridge. Accepts a bare address ("you@proton.me") or a
+            display-name form ("You <you@proton.me>"). Defaults to the
+            configured sending address.
 
     Returns:
         Confirmation with the sender, subject and recipient counts, or the
@@ -201,8 +272,11 @@ async def handle_send_email(
 
     try:
         return await asyncio.to_thread(
-            _send_email, to, cc, bcc, subject, body, importance, reply_to_id
+            _send_email, to, cc, bcc, subject, body, importance, reply_to_id,
+            from_address,
         )
+    except InvalidSender as e:
+        return str(e)
     except BadMessageId as e:
         return str(e)
     except FolderNotFound as e:

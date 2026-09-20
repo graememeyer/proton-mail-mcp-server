@@ -36,7 +36,7 @@ Proton
 | `list_emails` | Recent messages in a folder, newest first, with optional date window and unread filter |
 | `search_emails` | Search by sender, recipient, subject, body, free text, date range or attachments |
 | `read_email` | One message in full, with the body flattened to text |
-| `send_email` | Send a message, optionally as a threaded reply |
+| `send_email` | Send a message, optionally as a threaded reply or from another address on the account |
 | `list_folders` | The mailbox's system folders, user folders and labels, with counts |
 | `mark_email` | Mark a message read or unread |
 | `move_email` | Move a message to another folder (moving to `trash` is how you delete) |
