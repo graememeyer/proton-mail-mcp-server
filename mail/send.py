@@ -160,6 +160,36 @@ def _thread_headers(reply_to_id: str) -> Tuple[Optional[Tuple[str, str]], str]:
     return (message_id, references) if message_id else None, original.subject or ""
 
 
+def _describe_send_failure(
+    exc: Exception, envelope_sender: str, from_address: str
+) -> str:
+    """Explain a rejected submission, naming the sender when one was overridden.
+
+    Bridge does not refuse an address it does not own at MAIL FROM, where
+    smtplib would raise SMTPSenderRefused; it accepts the envelope and then
+    rejects the whole message at end-of-data with a 554 naming "sender or
+    recipient". So every SMTPException is funnelled through here, and a
+    caller-supplied From is called out as the first thing to check, since it is
+    by far the likeliest cause when one was given.
+    """
+    if isinstance(exc, smtplib.SMTPResponseException):
+        error = exc.smtp_error
+        if isinstance(error, bytes):
+            error = error.decode(errors="replace")
+        detail = f"{exc.smtp_code} {error}"
+    else:
+        detail = str(exc)
+
+    if from_address.strip():
+        return (
+            f"Proton Bridge rejected the message. Check the From address first: "
+            f"{envelope_sender!r} must be an active address on the account Bridge "
+            f"is logged in as ({settings.PROTON_BRIDGE_USER}); Bridge will not "
+            f"send as an address outside that account. Bridge reported: {detail}"
+        )
+    return f"Proton Bridge rejected the message. Bridge reported: {detail}"
+
+
 def _send_email(
     to: str,
     cc: str,
@@ -199,15 +229,9 @@ def _send_email(
                 from_addr=envelope_sender,
                 to_addrs=to_list + cc_list + bcc_list,
             )
-        except smtplib.SMTPSenderRefused as exc:
-            # Bridge refuses a From that is not an active address on the account
-            # it is logged in as. That is the common failure for this parameter,
-            # so name it rather than letting a raw SMTP code through.
+        except smtplib.SMTPException as exc:
             raise BridgeError(
-                f"Proton Bridge refused {envelope_sender!r} as the sender. It must "
-                f"be an active address on the account Bridge is logged in as "
-                f"({settings.PROTON_BRIDGE_USER}). Bridge reported: "
-                f"{exc.smtp_error.decode(errors='replace') if isinstance(exc.smtp_error, bytes) else exc.smtp_error}"
+                _describe_send_failure(exc, envelope_sender, from_address)
             ) from exc
 
     extra = (f" + {len(cc_list)} CC" if cc_list else "") + (

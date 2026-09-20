@@ -19,6 +19,7 @@ import threading
 import pytest
 
 from config import settings
+from mail.client import BridgeError
 from mail.send import _send_email
 
 
@@ -30,6 +31,9 @@ class _Transcript:
         self.rcpt_tos = []
         self.data = ""
         self.auth = None
+        # Set by a test to make the sink reject at end-of-data, which is where
+        # Bridge actually refuses a From it does not own.
+        self.reject_data = False
 
 
 class _SinkHandler(socketserver.StreamRequestHandler):
@@ -73,7 +77,13 @@ class _SinkHandler(socketserver.StreamRequestHandler):
                         break
                     lines.append(chunk.decode("utf-8", "replace"))
                 transcript.data = "".join(lines)
-                self.wfile.write(b"250 queued\r\n")
+                if transcript.reject_data:
+                    self.wfile.write(
+                        b"554 5.0.0 Error: The sender or recipient address is "
+                        b"not valid. Review the addresses and resend the message\r\n"
+                    )
+                else:
+                    self.wfile.write(b"250 queued\r\n")
             elif upper == "QUIT":
                 self.wfile.write(b"221 bye\r\n")
                 return
@@ -154,6 +164,33 @@ def test_bcc_reaches_the_envelope_but_not_the_headers(sink):
     _send(from_address="other@protonmail.com", bcc="secret@example.com")
     assert "secret@example.com" in sink.rcpt_tos
     assert "secret@example.com" not in sink.data
+
+
+def test_rejection_at_end_of_data_names_the_overridden_sender(sink):
+    # Bridge accepts the envelope and refuses the whole message at end-of-data,
+    # so this must be caught as a sender problem despite not being
+    # SMTPSenderRefused. Observed against a real Bridge: 554 "The sender or
+    # recipient address is not valid".
+    sink.reject_data = True
+
+    with pytest.raises(BridgeError) as caught:
+        _send(from_address="not-on-the-account@example.com")
+
+    message = str(caught.value)
+    assert "not-on-the-account@example.com" in message
+    assert settings.PROTON_BRIDGE_USER in message
+    assert "554" in message
+
+
+def test_rejection_without_an_override_does_not_blame_the_sender(sink):
+    sink.reject_data = True
+
+    with pytest.raises(BridgeError) as caught:
+        _send()
+
+    message = str(caught.value)
+    assert "Check the From address first" not in message
+    assert "554" in message
 
 
 def test_invalid_from_address_never_opens_a_connection(sink):
